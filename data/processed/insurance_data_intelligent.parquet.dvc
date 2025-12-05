@@ -1,0 +1,5 @@
+outs:
+- md5: 841909add134fe611966b3007504ec26
+  size: 13378146
+  hash: md5
+  path: insurance_data_intelligent.parquet

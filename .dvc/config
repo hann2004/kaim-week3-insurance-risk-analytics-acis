@@ -1,0 +1,6 @@
+[core]
+    remote = localstorage
+[cache]
+    type = "symlink,hardlink"
+['remote "localstorage"']
+    url = /home/nabi/dvc-storage/insurance-project
