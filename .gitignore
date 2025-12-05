@@ -22,7 +22,8 @@ venv.bak/
 # Data files (tracked via DVC later)
 data/raw/*.csv
 data/processed/*.csv
-data
+data/processed/*.parquet
+data/interim
 # DVC
 .dvc/tmp/
 .dvc/cache/
