@@ -248,6 +248,48 @@ class InsuranceDataLoader:
         self.data.to_parquet(output_path, index=False)
         print(f" Processed data saved to: {output_path}")
         print(f"   Size: {Path(output_path).stat().st_size / 1024**2:.2f} MB")
+    # Add this method to your InsuranceDataLoader class
+    def clean_numeric_columns(self):
+        """Clean numeric columns that have comma separators."""
+        print("\n Cleaning numeric columns with comma separators...")
+        
+        # Columns that likely have comma issues based on your data preview
+        comma_cols = ['mmcode', 'customvalueestimate', 'cubiccapacity', 
+                    'kilowatts', 'suminsured']
+        
+        for col in comma_cols:
+            if col in self.data.columns:
+                # Check if column is string type and contains commas
+                if self.data[col].dtype == 'object':
+                    # Remove commas and convert to numeric
+                    self.data[col] = (
+                        self.data[col]
+                        .astype(str)
+                        .str.replace(',', '')
+                        .str.replace(' ', '')
+                    )
+                    # Convert to numeric, coerce errors
+                    self.data[col] = pd.to_numeric(self.data[col], errors='coerce')
+                    print(f"   {col}: cleaned {self.data[col].isnull().sum()} problematic values")
+        
+        # Also handle other potential numeric columns
+        for col in self.data.columns:
+            if self.data[col].dtype == 'object':
+                # Check if it looks like a number with commas
+                sample = self.data[col].dropna().head(100) if not self.data[col].dropna().empty else []
+                if any(isinstance(x, str) and ',' in str(x) for x in sample):
+                    try:
+                        self.data[col] = (
+                            self.data[col]
+                            .astype(str)
+                            .str.replace(',', '')
+                            .str.replace(' ', '')
+                        )
+                        self.data[col] = pd.to_numeric(self.data[col], errors='ignore')
+                    except:
+                        pass
+        
+        print(" Numeric column cleaning complete")
 
 
 # Convenience function for quick loading
