@@ -26,5 +26,5 @@ pyarrow>=12.0.0
 
 # Jupyter
 jupyter>=1.0.0
-ipykernel>=6.0.0# Data Version Control
+ipykernel>=6.0.0
 dvc>=3.0.0
