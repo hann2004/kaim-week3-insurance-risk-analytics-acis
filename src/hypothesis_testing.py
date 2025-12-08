@@ -1,686 +1,342 @@
-"""
-Hypothesis Testing Module for Insurance Risk Analytics
+"""Hypothesis testing utilities for ACIS insurance risk analysis.
 
-Tests statistical hypotheses about risk differences across:
-- Provinces
-- Zip codes (postal codes)
-- Gender
-
-Uses appropriate statistical tests based on data distribution:
-- Parametric tests (ANOVA, t-test) for normally distributed data
-- Non-parametric tests (Kruskal-Wallis, Mann-Whitney U) for skewed data
+Implements chi-square and non-parametric tests to assess differences in
+claim frequency, claim severity, and margin across key segments.
 """
 
-import pandas as pd
-import numpy as np
-from scipy import stats
-from scipy.stats import (
-    chi2_contingency,
-    kruskal,
-    mannwhitneyu,
-    f_oneway,
-    shapiro,
-    normaltest
-)
 from pathlib import Path
-from typing import Dict, Tuple, Optional
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy import stats
 
 
-class HypothesisTester:
-    """Statistical hypothesis testing for insurance risk analytics."""
-    
-    def __init__(self, data: pd.DataFrame, alpha: float = 0.05):
-        """
-        Initialize hypothesis tester.
-        
-        Parameters
-        ----------
-        data : pd.DataFrame
-            Insurance data with columns: province, postalcode, gender, 
-            totalclaims, totalpremium
-        alpha : float, default=0.05
-            Significance level for hypothesis tests
-        """
-        self.data = data.copy()
-        self.alpha = alpha
-        self.results = {}
-        
-        # Ensure required columns exist
-        self._validate_columns()
-        
-        # Create derived metrics
-        self.data['has_claim'] = (self.data['totalclaims'] > 0).astype(int)
-        self.data['margin'] = self.data['totalpremium'] - self.data['totalclaims']
-        
-    def _validate_columns(self):
-        """Check that required columns exist."""
-        required = ['province', 'postalcode', 'gender', 'totalclaims', 'totalpremium']
-        missing = [col for col in required if col not in self.data.columns]
-        if missing:
-            raise ValueError(f"Missing required columns: {missing}")
-    
-    def check_normality(self, data: pd.Series, max_samples: int = 5000) -> Tuple[bool, float]:
-        """
-        Check if data is normally distributed.
-        
-        Parameters
-        ----------
-        data : pd.Series
-            Data to test
-        max_samples : int
-            Maximum samples for normality test (for performance)
-            
-        Returns
-        -------
-        is_normal : bool
-            True if data appears normally distributed
-        p_value : float
-            p-value from normality test
-        """
-        # Remove zeros and NaN
-        test_data = data[(data > 0) & data.notna()].dropna()
-        
-        if len(test_data) < 3:
-            return False, 1.0
-        
-        # Sample if too large (for performance)
-        if len(test_data) > max_samples:
-            test_data = test_data.sample(n=max_samples, random_state=42)
-        
-        # Use D'Agostino-Pearson test (more robust than Shapiro-Wilk for large samples)
-        try:
-            _, p_value = normaltest(test_data)
-            is_normal = p_value > 0.05
-        except:
-            # Fallback to Shapiro-Wilk for small samples
-            if len(test_data) < 5000:
-                _, p_value = shapiro(test_data)
-                is_normal = p_value > 0.05
-            else:
-                is_normal = False
-                p_value = 0.0
-        
-        return is_normal, p_value
-    
-    def test_claim_frequency(self, group_col: str, min_group_size: int = 50) -> Dict:
-        """
-        Test if claim frequency (proportion with claims) differs across groups.
-        Uses Chi-square test of independence.
-        
-        Parameters
-        ----------
-        group_col : str
-            Column to group by (e.g., 'province', 'postalcode')
-        min_group_size : int
-            Minimum observations per group to include in test
-            
-        Returns
-        -------
-        dict
-            Test results with p-value and statistics
-        """
-        # Filter groups with sufficient data
-        group_counts = self.data[group_col].value_counts()
-        valid_groups = group_counts[group_counts >= min_group_size].index
-        
-        if len(valid_groups) < 2:
-            return {
-                'chi2': np.nan,
-                'p_value': np.nan,
-                'dof': 0,
-                'valid_groups': len(valid_groups),
-                'message': 'Insufficient groups for testing'
-            }
-        
-        # Create contingency table
-        filtered_data = self.data[self.data[group_col].isin(valid_groups)]
-        contingency = pd.crosstab(filtered_data[group_col], filtered_data['has_claim'])
-        
-        # Chi-square test
-        chi2, p_value, dof, expected = chi2_contingency(contingency)
-        
-        return {
-            'chi2': chi2,
-            'p_value': p_value,
-            'dof': dof,
-            'valid_groups': len(valid_groups),
-            'contingency_table': contingency,
-            'expected_frequencies': expected
-        }
-    
-    def test_claim_severity(self, group_col: str, min_group_size: int = 50, 
-                           use_parametric: Optional[bool] = None) -> Dict:
-        """
-        Test if claim severity (claim amounts) differs across groups.
-        Uses ANOVA (parametric) or Kruskal-Wallis (non-parametric) based on data distribution.
-        
-        Parameters
-        ----------
-        group_col : str
-            Column to group by
-        min_group_size : int
-            Minimum observations per group
-        use_parametric : bool, optional
-            Force parametric (True) or non-parametric (False) test.
-            If None, automatically selects based on normality.
-            
-        Returns
-        -------
-        dict
-            Test results with p-value and test type used
-        """
-        # Filter to only policies with claims
-        claims_data = self.data[self.data['totalclaims'] > 0].copy()
-        
-        if len(claims_data) < 10:
-            return {
-                'test_type': 'insufficient_data',
-                'p_value': np.nan,
-                'statistic': np.nan,
-                'is_normal': False
-            }
-        
-        # Filter groups with sufficient data
-        group_counts = claims_data[group_col].value_counts()
-        valid_groups = group_counts[group_counts >= min_group_size].index
-        
-        if len(valid_groups) < 2:
-            return {
-                'test_type': 'insufficient_groups',
-                'p_value': np.nan,
-                'statistic': np.nan,
-                'valid_groups': len(valid_groups)
-            }
-        
-        # Prepare data for testing
-        filtered_data = claims_data[claims_data[group_col].isin(valid_groups)]
-        groups = [filtered_data[filtered_data[group_col] == group]['totalclaims'].values 
-                 for group in valid_groups]
-        
-        # Check normality if not specified
-        if use_parametric is None:
-            # Check normality of claim amounts
-            all_claims = filtered_data['totalclaims']
-            is_normal, normality_p = self.check_normality(all_claims)
-            use_parametric = is_normal
-        else:
-            normality_p = np.nan
-        
-        # Perform appropriate test
-        if use_parametric:
-            # ANOVA (parametric)
-            statistic, p_value = f_oneway(*groups)
-            test_type = 'ANOVA (F-test)'
-        else:
-            # Kruskal-Wallis (non-parametric)
-            statistic, p_value = kruskal(*groups)
-            test_type = 'Kruskal-Wallis'
-        
-        return {
-            'test_type': test_type,
-            'p_value': p_value,
-            'statistic': statistic,
-            'is_normal': use_parametric if use_parametric is not None else is_normal,
-            'normality_p': normality_p,
-            'valid_groups': len(valid_groups),
-            'group_means': {group: filtered_data[filtered_data[group_col] == group]['totalclaims'].mean() 
-                           for group in valid_groups}
-        }
-    
-    def test_margin_difference(self, group_col: str, min_group_size: int = 50,
-                              use_parametric: Optional[bool] = None) -> Dict:
-        """
-        Test if profit margin differs across groups.
-        Uses ANOVA (parametric) or Kruskal-Wallis (non-parametric).
-        
-        Parameters
-        ----------
-        group_col : str
-            Column to group by
-        min_group_size : int
-            Minimum observations per group
-        use_parametric : bool, optional
-            Force parametric or non-parametric test
-            
-        Returns
-        -------
-        dict
-            Test results
-        """
-        # Filter groups with sufficient data
-        group_counts = self.data[group_col].value_counts()
-        valid_groups = group_counts[group_counts >= min_group_size].index
-        
-        if len(valid_groups) < 2:
-            return {
-                'test_type': 'insufficient_groups',
-                'p_value': np.nan,
-                'statistic': np.nan,
-                'valid_groups': len(valid_groups)
-            }
-        
-        # Prepare data
-        filtered_data = self.data[self.data[group_col].isin(valid_groups)]
-        groups = [filtered_data[filtered_data[group_col] == group]['margin'].values 
-                 for group in valid_groups]
-        
-        # Check normality if not specified
-        if use_parametric is None:
-            all_margins = filtered_data['margin']
-            is_normal, normality_p = self.check_normality(all_margins)
-            use_parametric = is_normal
-        else:
-            normality_p = np.nan
-        
-        # Perform test
-        if use_parametric:
-            statistic, p_value = f_oneway(*groups)
-            test_type = 'ANOVA (F-test)'
-        else:
-            statistic, p_value = kruskal(*groups)
-            test_type = 'Kruskal-Wallis'
-        
-        return {
-            'test_type': test_type,
-            'p_value': p_value,
-            'statistic': statistic,
-            'is_normal': use_parametric if use_parametric is not None else is_normal,
-            'normality_p': normality_p,
-            'valid_groups': len(valid_groups),
-            'group_means': {group: filtered_data[filtered_data[group_col] == group]['margin'].mean() 
-                           for group in valid_groups}
-        }
-    
-    def test_gender_difference(self, metric: str = 'severity', 
-                               min_group_size: int = 10) -> Dict:
-        """
-        Test if risk differs between men and women.
-        Uses t-test (parametric) or Mann-Whitney U (non-parametric) for two groups.
-        
-        Parameters
-        ----------
-        metric : str
-            'frequency' for claim rate, 'severity' for claim amounts
-        min_group_size : int
-            Minimum observations per gender group
-            
-        Returns
-        -------
-        dict
-            Test results
-        """
-        # Filter to Male and Female only (exclude "Not specified")
-        gender_data = self.data[self.data['gender'].isin(['Male', 'Female'])].copy()
-        
-        male_data = gender_data[gender_data['gender'] == 'Male']
-        female_data = gender_data[gender_data['gender'] == 'Female']
-        
-        if len(male_data) < min_group_size or len(female_data) < min_group_size:
-            return {
-                'test_type': 'insufficient_data',
-                'p_value': np.nan,
-                'statistic': np.nan,
-                'message': f'Insufficient data: Male={len(male_data)}, Female={len(female_data)}'
-            }
-        
-        if metric == 'frequency':
-            # Chi-square test for proportions
-            contingency = pd.crosstab(gender_data['gender'], gender_data['has_claim'])
-            chi2, p_value, dof, _ = chi2_contingency(contingency)
-            return {
-                'test_type': 'Chi-square',
-                'p_value': p_value,
-                'statistic': chi2,
-                'dof': dof
-            }
-        
-        elif metric == 'severity':
-            # Test claim amounts (only policies with claims)
-            male_claims = male_data[male_data['totalclaims'] > 0]['totalclaims']
-            female_claims = female_data[female_data['totalclaims'] > 0]['totalclaims']
-            
-            if len(male_claims) < 3 or len(female_claims) < 3:
-                return {
-                    'test_type': 'insufficient_data',
-                    'p_value': np.nan,
-                    'statistic': np.nan,
-                    'message': 'Insufficient claims for severity test'
-                }
-            
-            # Check normality
-            male_normal, _ = self.check_normality(male_claims)
-            female_normal, _ = self.check_normality(female_claims)
-            use_parametric = male_normal and female_normal
-            
-            # Perform test
-            if use_parametric:
-                statistic, p_value = stats.ttest_ind(male_claims, female_claims)
-                test_type = 't-test (independent samples)'
-            else:
-                statistic, p_value = mannwhitneyu(male_claims, female_claims, 
-                                                 alternative='two-sided')
-                test_type = 'Mann-Whitney U'
-            
-            return {
-                'test_type': test_type,
-                'p_value': p_value,
-                'statistic': statistic,
-                'male_normal': male_normal,
-                'female_normal': female_normal
-            }
-    
-    def calculate_summary_stats(self, group_col: str) -> pd.DataFrame:
-        """Calculate summary statistics by group."""
-        summary = self.data.groupby(group_col).agg({
-            'policyid': 'count',  # Count policies
-            'has_claim': 'mean',  # Claim rate
-            'totalpremium': 'sum',
-            'totalclaims': 'sum'
-        }).rename(columns={
-            'policyid': 'policies',
-            'has_claim': 'claim_rate'
-        })
-        
-        # Calculate loss ratio
-        summary['loss_ratio'] = summary['totalclaims'] / summary['totalpremium']
-        
-        # Calculate average claim amount (only for policies with claims)
-        claims_data = self.data[self.data['totalclaims'] > 0]
-        if len(claims_data) > 0:
-            avg_claims = claims_data.groupby(group_col)['totalclaims'].mean()
-            summary['avg_claim_given_claim'] = avg_claims
-        else:
-            summary['avg_claim_given_claim'] = 0
-        
-        # Calculate margin
-        summary['margin'] = self.data.groupby(group_col)['margin'].mean()
-        
-        return summary.fillna(0).sort_values('policies', ascending=False)
-    
-    def test_provinces(self) -> Dict:
-        """Test all province-related hypotheses."""
-        print("Testing province hypotheses...")
-        
-        # Frequency test
-        freq_result = self.test_claim_frequency('province', min_group_size=50)
-        
-        # Severity test
-        sev_result = self.test_claim_severity('province', min_group_size=50)
-        
-        # Summary statistics
-        summary = self.calculate_summary_stats('province')
-        
-        return {
-            'chi2_p': freq_result['p_value'],
-            'severity_p': sev_result['p_value'],
-            'frequency_test': freq_result,
-            'severity_test': sev_result,
-            'summary': summary
-        }
-    
-    def test_zipcodes(self) -> Dict:
-        """Test all zip code-related hypotheses."""
-        print("Testing zip code hypotheses...")
-        
-        # Frequency test
-        freq_result = self.test_claim_frequency('postalcode', min_group_size=50)
-        
-        # Severity test
-        sev_result = self.test_claim_severity('postalcode', min_group_size=50)
-        
-        # Margin test
-        margin_result = self.test_margin_difference('postalcode', min_group_size=50)
-        
-        # Summary statistics (top 10)
-        summary = self.calculate_summary_stats('postalcode').head(10)
-        
-        return {
-            'chi2_p': freq_result['p_value'],
-            'severity_p': sev_result['p_value'],
-            'margin_p': margin_result['p_value'],
-            'frequency_test': freq_result,
-            'severity_test': sev_result,
-            'margin_test': margin_result,
-            'summary': summary
-        }
-    
-    def test_gender(self) -> Dict:
-        """Test gender-related hypotheses."""
-        print("Testing gender hypotheses...")
-        
-        # Frequency test
-        freq_result = self.test_gender_difference('frequency', min_group_size=10)
-        
-        # Severity test
-        sev_result = self.test_gender_difference('severity', min_group_size=10)
-        
-        # Summary statistics
-        summary = self.calculate_summary_stats('gender')
-        
-        return {
-            'chi2_p': freq_result['p_value'],
-            'severity_p': sev_result['p_value'],
-            'frequency_test': freq_result,
-            'severity_test': sev_result,
-            'summary': summary
-        }
-    
-    def run_all_tests(self) -> Dict:
-        """Run all hypothesis tests."""
-        print("=" * 60)
-        print("Running All Hypothesis Tests")
-        print("=" * 60)
-        
-        results = {
-            'provinces': self.test_provinces(),
-            'zipcodes': self.test_zipcodes(),
-            'gender': self.test_gender()
-        }
-        
-        self.results = results
-        return results
-    
-    def generate_report(self, report_path: str = 'reports/hypothesis_testing.md') -> str:
-        """Generate Markdown report from test results."""
-        if not self.results:
-            self.run_all_tests()
-        
-        report_dir = Path(report_path).parent
-        report_dir.mkdir(parents=True, exist_ok=True)
-        
-        with open(report_path, 'w') as f:
-            f.write("# Hypothesis Testing Results\n\n")
-            f.write(f"Generated: {pd.Timestamp.now()}\n\n\n")
-            
-            # Executive Summary
-            f.write("## Executive Summary\n\n")
-            f.write("This report presents statistical hypothesis tests to validate risk differences across ")
-            f.write("geographic regions (provinces, zip codes) and demographic segments (gender). ")
-            f.write("Results inform pricing strategy and market segmentation decisions.\n\n")
-            
-            # Provinces
-            f.write("## 1. Provinces - Risk Differences\n\n")
-            f.write("### Null Hypothesis: There are no risk differences across provinces\n\n\n")
-            
-            prov_results = self.results['provinces']
-            chi2_p = prov_results['chi2_p']
-            sev_p = prov_results['severity_p']
-            
-            f.write(f"**Claim Frequency Test**: p={chi2_p:.4f} -> **{'reject H0' if chi2_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if chi2_p < self.alpha:
-                summary = prov_results['summary']
-                max_lr = summary['loss_ratio'].idxmax()
-                min_lr = summary['loss_ratio'].idxmin()
-                f.write(f"**REJECT H0**: Significant risk differences exist across provinces (p={chi2_p:.4f}). ")
-                f.write(f"{max_lr} exhibits {summary.loc[max_lr, 'loss_ratio']:.1%} loss ratio vs {min_lr} at {summary.loc[min_lr, 'loss_ratio']:.1%}. ")
-                f.write("Regional pricing adjustment recommended.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant risk differences across provinces.\n\n")
-            
-            f.write(f"**Claim Severity Test**: p={sev_p:.4f} -> **{'reject H0' if sev_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if sev_p < self.alpha:
-                summary = prov_results['summary']
-                f.write(f"**REJECT H0**: Claim severity varies significantly by province (p={sev_p:.4f}). ")
-                f.write(f"Average claim amount ranges from R{summary['avg_claim_given_claim'].min():,.0f} to R{summary['avg_claim_given_claim'].max():,.0f}. ")
-                f.write("Consider province-specific excess amounts.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant severity differences.\n\n")
-            
-            # Province summary table
-            f.write("### Province Summary Statistics\n\n\n")
-            summary = prov_results['summary']
-            f.write(summary.to_markdown())
-            f.write("\n\n\n")
-            
-            # Zip codes
-            f.write("## 2. Zip Codes - Risk and Margin Differences\n\n")
-            f.write("### Null Hypothesis 1: There are no risk differences between zip codes\n\n\n")
-            
-            zip_results = self.results['zipcodes']
-            zip_chi2_p = zip_results['chi2_p']
-            zip_sev_p = zip_results['severity_p']
-            zip_margin_p = zip_results['margin_p']
-            
-            f.write(f"**Claim Frequency Test**: p={zip_chi2_p:.4f} -> **{'reject H0' if zip_chi2_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if zip_chi2_p < self.alpha:
-                summary = zip_results['summary']
-                if len(summary) > 0:
-                    max_lr_idx = summary['loss_ratio'].idxmax()
-                    f.write(f"**REJECT H0**: Significant risk differences exist between zip codes (p={zip_chi2_p:.4f}). ")
-                    f.write(f"Postal code {max_lr_idx} shows {summary.loc[max_lr_idx, 'loss_ratio']:.1%} loss ratio. ")
-                    f.write("Granular pricing by postal code may be warranted.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant zip code differences.\n\n")
-            
-            f.write(f"**Claim Severity Test**: p={zip_sev_p:.4f} -> **{'reject H0' if zip_sev_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if zip_sev_p < self.alpha:
-                f.write(f"**REJECT H0**: Statistically significant difference detected (p={zip_sev_p:.4f}). Further investigation recommended.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant severity differences.\n\n")
-            
-            f.write("### Null Hypothesis 2: There is no significant margin (profit) difference between zip codes\n\n\n")
-            f.write(f"**Margin Test**: p={zip_margin_p:.4f} -> **{'reject H0' if zip_margin_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if zip_margin_p < self.alpha:
-                summary = zip_results['summary']
-                if len(summary) > 0:
-                    f.write(f"**REJECT H0**: Significant margin differences between zip codes (p={zip_margin_p:.4f}). ")
-                    f.write(f"Average margin ranges from R{summary['margin'].min():,.0f} to R{summary['margin'].max():,.0f}. ")
-                    f.write("Investigate high-risk postal codes for targeted interventions.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant margin differences.\n\n")
-            
-            # Zip code summary
-            f.write("### Top Zip Code Summary\n\n\n")
-            summary = zip_results['summary']
-            f.write(summary.to_markdown())
-            f.write("\n\n\n")
-            
-            # Gender
-            f.write("## 3. Gender - Risk Differences\n\n")
-            f.write("### Null Hypothesis: There is no significant risk difference between Women and Men\n\n\n")
-            
-            gender_results = self.results['gender']
-            gen_chi2_p = gender_results['chi2_p']
-            gen_sev_p = gender_results['severity_p']
-            
-            f.write(f"**Claim Frequency Test**: p={gen_chi2_p:.4f} -> **{'reject H0' if gen_chi2_p < self.alpha else 'fail to reject H0'}**\n\n")
-            if gen_chi2_p < self.alpha:
-                summary = gender_results['summary']
-                f.write(f"**REJECT H0**: Significant risk difference between genders (p={gen_chi2_p:.4f}). ")
-                if 'Male' in summary.index and 'Female' in summary.index:
-                    f.write(f"Male loss ratio: {summary.loc['Male', 'loss_ratio']:.1%}, Female loss ratio: {summary.loc['Female', 'loss_ratio']:.1%}. ")
-                f.write("Consider gender-based pricing if legally permissible.\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant gender differences.\n\n")
-            
-            f.write(f"**Claim Severity Test**: p={gen_sev_p:.4f} -> **{'insufficient data' if pd.isna(gen_sev_p) else ('reject H0' if gen_sev_p < self.alpha else 'fail to reject H0')}**\n\n")
-            if pd.isna(gen_sev_p):
-                f.write("No statistically significant difference detected (p=nan). No immediate action required.\n\n")
-            elif gen_sev_p < self.alpha:
-                f.write(f"**REJECT H0**: Significant severity difference (p={gen_sev_p:.4f}).\n\n")
-            else:
-                f.write("**FAIL TO REJECT H0**: No significant severity difference.\n\n")
-            
-            # Gender summary
-            f.write("### Gender Summary Statistics\n\n\n")
-            summary = gender_results['summary']
-            f.write(summary.to_markdown())
-            f.write("\n\n\n")
-            
-            # Business recommendations
-            f.write("## 4. Business Recommendations\n\n\n")
-            f.write("### Immediate Actions (Next 30 Days)\n\n\n")
-            f.write("Based on rejected null hypotheses, the following actions are recommended:\n\n\n")
-            
-            rejected = []
-            if chi2_p < self.alpha or sev_p < self.alpha:
-                rejected.append("1. **Province-based risk differences**: Implement segment-specific pricing adjustments.")
-            if zip_chi2_p < self.alpha or zip_sev_p < self.alpha or zip_margin_p < self.alpha:
-                rejected.append("2. **Zip code-based risk differences**: Implement segment-specific pricing adjustments.")
-            if gen_chi2_p < self.alpha or gen_sev_p < self.alpha:
-                rejected.append("3. **Gender-based risk differences**: Implement segment-specific pricing adjustments.")
-            
-            if rejected:
-                for item in rejected:
-                    f.write(f"{item}\n\n")
-            else:
-                f.write("No significant differences detected. Current pricing strategy appears appropriate.\n\n")
-            
-            f.write("### Strategic Recommendations\n\n\n")
-            f.write("1. **Geographic Segmentation**: Develop province and postal code risk tiers for pricing.\n\n")
-            f.write("2. **Risk-Based Pricing**: Adjust premiums based on statistically validated risk factors.\n\n")
-            f.write("3. **Monitoring**: Establish quarterly review cycles to track risk evolution.\n\n")
-            f.write("4. **Compliance**: Ensure all pricing adjustments comply with local insurance regulations.\n\n\n")
-            
-            # Methodology
-            f.write("### Methodology Notes\n\n\n")
-            f.write(f"- **Significance Level**: α = {self.alpha}\n\n")
-            f.write("- **Claim Frequency**: Chi-square test of independence\n\n")
-            f.write("- **Claim Severity**: ANOVA (if normal) or Kruskal-Wallis test (if non-normal)\n\n")
-            f.write("- **Margin Analysis**: ANOVA (if normal) or Kruskal-Wallis test (if non-normal)\n\n")
-            f.write("- **Gender Comparison**: t-test (if normal) or Mann-Whitney U test (if non-normal)\n\n")
-            f.write("- Tests filter categories with <50 observations (10 for gender) to ensure statistical validity\n\n")
-        
-        return report_path
+# Columns that may exist in the cleaned datasets. Fallback order matters.
+COL_CHOICES = {
+    "province": ["province", "Province"],
+    "zipcode": ["postalcode", "zip", "zipcode", "zip_code"],
+    "gender": ["gender_clean", "gender", "Gender"],
+    "total_premium": ["totalpremium", "TotalPremium"],
+    "total_claims": ["totalclaims", "TotalClaims"],
+}
 
 
-def run(data_path: str = 'data/processed/insurance_data_final_cleaned.parquet',
-        report_path: str = 'reports/hypothesis_testing.md',
-        alpha: float = 0.05) -> Dict:
-    """
-    Convenience function to run all hypothesis tests.
-    
-    Parameters
-    ----------
-    data_path : str
-        Path to processed insurance data (parquet file)
-    report_path : str
-        Path to save the report
-    alpha : float
-        Significance level
+def _pick_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    """Return the first column name that exists in the DataFrame."""
+    for name in candidates:
+        if name in df.columns:
+            return name
+    raise KeyError(f"None of the candidate columns are present: {candidates}")
+
+
+def load_dataset(path: str) -> pd.DataFrame:
+    """Load the parquet dataset and derive helper columns."""
+    df = pd.read_parquet(path)
+
+    premium_col = _pick_column(df, COL_CHOICES["total_premium"])
+    claims_col = _pick_column(df, COL_CHOICES["total_claims"])
+
+    df = df.copy()
+    df["has_claim"] = df[claims_col].fillna(0) > 0
+    df["margin"] = df[premium_col].fillna(0) - df[claims_col].fillna(0)
+    df["claims_positive"] = df[claims_col].fillna(0)
+    return df
+
+
+def chi_square_frequency(df: pd.DataFrame, category: str, min_count: int = 50) -> Tuple[float, float, int]:
+    """Chi-square test for association between category and claim frequency."""
+    filtered = _filter_by_count(df, category, min_count)
+    table = pd.crosstab(filtered[category], filtered["has_claim"])
+    chi2, p, _, _ = stats.chi2_contingency(table)
+    return chi2, p, table.shape[0]
+
+
+def kruskal_by_group(df: pd.DataFrame, category: str, value_col: str, min_count: int = 50) -> Tuple[float, float, int]:
+    """Kruskal-Wallis test comparing a numeric value across category groups."""
+    filtered = _filter_by_count(df, category, min_count)
+    groups = [grp[value_col].dropna().values for _, grp in filtered.groupby(category)]
+    groups = [g for g in groups if len(g) > 0]
+    if len(groups) < 2:
+        return np.nan, np.nan, len(groups)
+    stat, p = stats.kruskal(*groups)
+    return stat, p, len(groups)
+
+
+def mannwhitney_two_groups(df: pd.DataFrame, category: str, value_col: str) -> Tuple[float, float]:
+    """Mann-Whitney test for two-group comparison."""
+    groups = [grp[value_col].dropna().values for _, grp in df.groupby(category)]
+    if len(groups) != 2 or any(len(g) == 0 for g in groups):
+        return np.nan, np.nan
+    stat, p = stats.mannwhitneyu(groups[0], groups[1], alternative="two-sided")
+    return stat, p
+
+
+def _filter_by_count(df: pd.DataFrame, category: str, min_count: int) -> pd.DataFrame:
+    counts = df[category].value_counts()
+    keep = counts[counts >= min_count].index
+    return df[df[category].isin(keep)].copy()
+
+
+def summarize_metric(df: pd.DataFrame, category: str, claims_col: str, premium_col: str) -> pd.DataFrame:
+    """Compute loss ratio, claim rate, and severity per category."""
+    grouped = df.groupby(category).agg(
+        policies=(claims_col, "size"),
+        claim_rate=("has_claim", "mean"),
+        loss_ratio=(claims_col, "sum"),
+        premium_sum=(premium_col, "sum"),
+        avg_claim_given_claim=(claims_col, lambda s: s[s > 0].mean() if (s > 0).any() else 0),
+    )
+    grouped["loss_ratio"] = grouped["loss_ratio"] / grouped["premium_sum"].replace(0, np.nan)
+    grouped = grouped.drop(columns=["premium_sum"])
+    return grouped.reset_index()
+
+
+def run_hypothesis_tests(df: pd.DataFrame) -> Dict:
+    """Execute hypothesis tests and return structured results."""
+    province_col = _pick_column(df, COL_CHOICES["province"])
+    zip_col = _pick_column(df, COL_CHOICES["zipcode"])
+    gender_col = _pick_column(df, COL_CHOICES["gender"])
+    premium_col = _pick_column(df, COL_CHOICES["total_premium"])
+    claims_col = _pick_column(df, COL_CHOICES["total_claims"])
+
+    results = {}
+
+    # Provinces: frequency and severity
+    chi2, p, k = chi_square_frequency(df, province_col)
+    sev_stat, sev_p, sev_groups = kruskal_by_group(df[df["has_claim"]], province_col, claims_col)
+    results["provinces"] = {
+        "chi2_stat": chi2,
+        "chi2_p": p,
+        "chi2_groups": k,
+        "severity_stat": sev_stat,
+        "severity_p": sev_p,
+        "severity_groups": sev_groups,
+        "summary": summarize_metric(df, province_col, claims_col, premium_col),
+    }
+
+    # Zip codes: frequency and severity
+    chi2, p, k = chi_square_frequency(df, zip_col)
+    sev_stat, sev_p, sev_groups = kruskal_by_group(df[df["has_claim"]], zip_col, claims_col)
+    margin_stat, margin_p, margin_groups = kruskal_by_group(df, zip_col, "margin")
+    results["zipcodes"] = {
+        "chi2_stat": chi2,
+        "chi2_p": p,
+        "chi2_groups": k,
+        "severity_stat": sev_stat,
+        "severity_p": sev_p,
+        "severity_groups": sev_groups,
+        "margin_stat": margin_stat,
+        "margin_p": margin_p,
+        "margin_groups": margin_groups,
+        "summary": summarize_metric(df, zip_col, claims_col, premium_col),
+    }
+
+    # Gender: frequency and severity (two-group)
+    chi2, p, _ = chi_square_frequency(df, gender_col, min_count=10)
+    mw_stat, mw_p = mannwhitney_two_groups(df[df["has_claim"]], gender_col, claims_col)
+    results["gender"] = {
+        "chi2_stat": chi2,
+        "chi2_p": p,
+        "severity_stat": mw_stat,
+        "severity_p": mw_p,
+        "summary": summarize_metric(df, gender_col, claims_col, premium_col),
+    }
+
+    return results
+
+
+def write_report(results: Dict, output_path: str, df: pd.DataFrame = None) -> str:
+    """Write a Markdown report summarizing hypothesis test outcomes with business recommendations."""
+    lines = []
+    lines.append("# Hypothesis Testing Results\n")
+    lines.append(f"Generated: {pd.Timestamp.now()}\n")
+    lines.append("\n## Executive Summary\n")
+    lines.append("This report presents statistical hypothesis tests to validate risk differences across ")
+    lines.append("geographic regions (provinces, zip codes) and demographic segments (gender). ")
+    lines.append("Results inform pricing strategy and market segmentation decisions.\n")
+
+    def decision(p: float) -> str:
+        if np.isnan(p):
+            return "insufficient data"
+        return "reject H0" if p < 0.05 else "fail to reject H0"
+
+    def get_business_interpretation(category: str, test_name: str, p_value: float, summary_df: pd.DataFrame, 
+                                   margin_data: pd.DataFrame = None) -> str:
+        """Generate business interpretation for test results."""
+        if np.isnan(p_value) or p_value >= 0.05:
+            return f"No statistically significant difference detected (p={p_value:.4f}). No immediate action required."
         
-    Returns
-    -------
-    dict
-        Test results
-    """
-    print(f"Loading data from: {data_path}")
-    data = pd.read_parquet(data_path)
-    print(f"Data loaded: {data.shape[0]:,} rows, {data.shape[1]:,} columns\n")
+        # For rejected hypotheses, provide specific insights
+        if category == "provinces":
+            if test_name == "frequency":
+                worst = summary_df.nlargest(1, "loss_ratio")
+                best = summary_df.nsmallest(1, "loss_ratio")
+                if len(worst) > 0 and len(best) > 0:
+                    worst_prov = worst.iloc[0]
+                    best_prov = best.iloc[0]
+                    cat_col = summary_df.columns[0]  # First column is the category
+                    return (f"**REJECT H0**: Significant risk differences exist across provinces (p={p_value:.4f}). "
+                           f"{worst_prov[cat_col]} exhibits {worst_prov['loss_ratio']:.1%} loss ratio vs "
+                           f"{best_prov[cat_col]} at {best_prov['loss_ratio']:.1%}. Regional pricing adjustment recommended.")
+            elif test_name == "severity":
+                worst = summary_df.nlargest(1, "avg_claim_given_claim")
+                best = summary_df.nsmallest(1, "avg_claim_given_claim")
+                if len(worst) > 0 and len(best) > 0:
+                    return (f"**REJECT H0**: Claim severity varies significantly by province (p={p_value:.4f}). "
+                           f"Average claim amount ranges from R{best.iloc[0]['avg_claim_given_claim']:,.0f} to "
+                           f"R{worst.iloc[0]['avg_claim_given_claim']:,.0f}. Consider province-specific excess amounts.")
+        
+        elif category == "zipcodes":
+            if test_name == "frequency":
+                worst = summary_df.nlargest(1, "loss_ratio")
+                best = summary_df.nsmallest(1, "loss_ratio")
+                if len(worst) > 0 and len(best) > 0:
+                    cat_col = summary_df.columns[0]
+                    return (f"**REJECT H0**: Significant risk differences exist between zip codes (p={p_value:.4f}). "
+                           f"Postal code {worst.iloc[0][cat_col]} shows {worst.iloc[0]['loss_ratio']:.1%} loss ratio. "
+                           f"Granular pricing by postal code may be warranted.")
+            elif test_name == "margin":
+                # For margin, we need to calculate from the original data
+                if margin_data is not None and len(margin_data) > 0:
+                    margin_summary = margin_data.groupby(margin_data.columns[0])['margin'].agg(['mean', 'count'])
+                    margin_summary = margin_summary[margin_summary['count'] >= 10].sort_values('mean')
+                    if len(margin_summary) > 0:
+                        worst_margin = margin_summary.iloc[0]
+                        best_margin = margin_summary.iloc[-1]
+                        return (f"**REJECT H0**: Significant margin differences between zip codes (p={p_value:.4f}). "
+                               f"Average margin ranges from R{worst_margin['mean']:,.0f} to R{best_margin['mean']:,.0f}. "
+                               f"Investigate high-risk postal codes for targeted interventions.")
+                return (f"**REJECT H0**: Significant margin differences between zip codes (p={p_value:.4f}). "
+                       f"Profitability varies substantially. Investigate high-risk postal codes for targeted interventions.")
+        
+        elif category == "gender":
+            if len(summary_df) >= 2:
+                cat_col = summary_df.columns[0]
+                male = summary_df[summary_df[cat_col].astype(str).str.contains('M|Male', case=False, na=False)]
+                female = summary_df[summary_df[cat_col].astype(str).str.contains('F|Female', case=False, na=False)]
+                if len(male) > 0 and len(female) > 0:
+                    m_lr = male.iloc[0]['loss_ratio']
+                    f_lr = female.iloc[0]['loss_ratio']
+                    return (f"**REJECT H0**: Significant risk difference between genders (p={p_value:.4f}). "
+                           f"Male loss ratio: {m_lr:.1%}, Female loss ratio: {f_lr:.1%}. "
+                           f"Consider gender-based pricing if legally permissible.")
+        
+        return f"**REJECT H0**: Statistically significant difference detected (p={p_value:.4f}). Further investigation recommended."
+
+    # Provinces
+    prov = results["provinces"]
+    lines.append("## 1. Provinces - Risk Differences\n")
+    lines.append("### Null Hypothesis: There are no risk differences across provinces\n\n")
     
-    tester = HypothesisTester(data, alpha=alpha)
-    results = tester.run_all_tests()
+    freq_decision = decision(prov['chi2_p'])
+    sev_decision = decision(prov['severity_p'])
     
-    print(f"\nGenerating report: {report_path}")
-    tester.generate_report(report_path)
+    lines.append(f"**Claim Frequency Test**: p={prov['chi2_p']:.4f} -> **{freq_decision}**\n")
+    lines.append(f"{get_business_interpretation('provinces', 'frequency', prov['chi2_p'], prov['summary'])}\n\n")
     
+    lines.append(f"**Claim Severity Test**: p={prov['severity_p']:.4f} -> **{sev_decision}**\n")
+    lines.append(f"{get_business_interpretation('provinces', 'severity', prov['severity_p'], prov['summary'])}\n\n")
+    
+    lines.append("### Province Summary Statistics\n\n")
+    lines.append(prov["summary"].sort_values("policies", ascending=False).head(10).to_markdown(index=False))
+    lines.append("\n\n")
+
+    # Zip codes
+    zc = results["zipcodes"]
+    lines.append("## 2. Zip Codes - Risk and Margin Differences\n")
+    lines.append("### Null Hypothesis 1: There are no risk differences between zip codes\n\n")
+    
+    zc_freq_decision = decision(zc['chi2_p'])
+    zc_sev_decision = decision(zc['severity_p'])
+    zc_margin_decision = decision(zc['margin_p'])
+    
+    lines.append(f"**Claim Frequency Test**: p={zc['chi2_p']:.4f} -> **{zc_freq_decision}**\n")
+    lines.append(f"{get_business_interpretation('zipcodes', 'frequency', zc['chi2_p'], zc['summary'])}\n\n")
+    
+    lines.append(f"**Claim Severity Test**: p={zc['severity_p']:.4f} -> **{zc_sev_decision}**\n")
+    lines.append(f"{get_business_interpretation('zipcodes', 'severity', zc['severity_p'], zc['summary'])}\n\n")
+    
+    lines.append("### Null Hypothesis 2: There is no significant margin (profit) difference between zip codes\n\n")
+    lines.append(f"**Margin Test**: p={zc['margin_p']:.4f} -> **{zc_margin_decision}**\n")
+    # For margin interpretation, calculate from original dataframe if available
+    margin_data = None
+    if df is not None:
+        zip_col = df.columns[df.columns.str.contains('postal|zip', case=False)][0] if len(df.columns[df.columns.str.contains('postal|zip', case=False)]) > 0 else None
+        if zip_col:
+            margin_data = df[[zip_col, 'margin']].copy()
+    lines.append(f"{get_business_interpretation('zipcodes', 'margin', zc['margin_p'], zc['summary'], margin_data)}\n\n")
+    
+    lines.append("### Top Zip Code Summary\n\n")
+    lines.append(zc["summary"].sort_values("policies", ascending=False).head(10).to_markdown(index=False))
+    lines.append("\n\n")
+
+    # Gender
+    gen = results["gender"]
+    lines.append("## 3. Gender - Risk Differences\n")
+    lines.append("### Null Hypothesis: There is no significant risk difference between Women and Men\n\n")
+    
+    gen_freq_decision = decision(gen['chi2_p'])
+    gen_sev_decision = decision(gen['severity_p'])
+    
+    lines.append(f"**Claim Frequency Test**: p={gen['chi2_p']:.4f} -> **{gen_freq_decision}**\n")
+    lines.append(f"{get_business_interpretation('gender', 'frequency', gen['chi2_p'], gen['summary'])}\n\n")
+    
+    lines.append(f"**Claim Severity Test**: p={gen['severity_p']:.4f} -> **{gen_sev_decision}**\n")
+    lines.append(f"{get_business_interpretation('gender', 'severity', gen['severity_p'], gen['summary'])}\n\n")
+    
+    lines.append("### Gender Summary Statistics\n\n")
+    lines.append(gen["summary"].sort_values("policies", ascending=False).to_markdown(index=False))
+    lines.append("\n\n")
+
+    # Business Recommendations Section
+    lines.append("## 4. Business Recommendations\n\n")
+    lines.append("### Immediate Actions (Next 30 Days)\n\n")
+    
+    rejected_tests = []
+    if prov['chi2_p'] < 0.05:
+        rejected_tests.append("Province-based risk differences")
+    if zc['chi2_p'] < 0.05:
+        rejected_tests.append("Zip code-based risk differences")
+    if zc['margin_p'] < 0.05:
+        rejected_tests.append("Zip code margin differences")
+    if gen['chi2_p'] < 0.05:
+        rejected_tests.append("Gender-based risk differences")
+    
+    if rejected_tests:
+        lines.append("Based on rejected null hypotheses, the following actions are recommended:\n\n")
+        for i, test in enumerate(rejected_tests, 1):
+            lines.append(f"{i}. **{test}**: Implement segment-specific pricing adjustments.\n")
+        
+        lines.append("\n### Strategic Recommendations\n\n")
+        lines.append("1. **Geographic Segmentation**: Develop province and postal code risk tiers for pricing.\n")
+        lines.append("2. **Risk-Based Pricing**: Adjust premiums based on statistically validated risk factors.\n")
+        lines.append("3. **Monitoring**: Establish quarterly review cycles to track risk evolution.\n")
+        lines.append("4. **Compliance**: Ensure all pricing adjustments comply with local insurance regulations.\n")
+    else:
+        lines.append("No statistically significant differences detected. Current pricing strategy appears appropriate.\n")
+        lines.append("Continue monitoring and reassess quarterly.\n")
+    
+    lines.append("\n### Methodology Notes\n\n")
+    lines.append("- **Significance Level**: α = 0.05\n")
+    lines.append("- **Claim Frequency**: Chi-square test of independence\n")
+    lines.append("- **Claim Severity**: Kruskal-Wallis test (non-parametric, handles non-normal distributions)\n")
+    lines.append("- **Margin Analysis**: Kruskal-Wallis test comparing profit margins\n")
+    lines.append("- **Gender Comparison**: Mann-Whitney U test for two-group comparison\n")
+    lines.append("- Tests filter categories with <50 observations (10 for gender) to ensure statistical validity\n")
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_path).write_text("\n".join(lines))
+    return str(output_path)
+
+
+def run(path: str = "data/processed/insurance_data_final_cleaned.parquet", report_path: str = "reports/hypothesis_testing.md") -> Dict:
+    """Convenience wrapper to load data, run tests, and write the report."""
+    df = load_dataset(path)
+    results = run_hypothesis_tests(df)
+    write_report(results, report_path, df)
     return results
 
 
 if __name__ == "__main__":
-    # Example usage
-    results = run()
-    print("\nHypothesis testing complete!")
-
+    run()
