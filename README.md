@@ -48,6 +48,15 @@ python scripts/run_hypothesis_tests.py \
 ```
 Console output shows reject/fail decisions; full Markdown report is saved to `reports/hypothesis_testing.md`.
 
+## Modeling (Task-4)
+Train claim frequency, claim severity, and premium regression models and generate a report:
+```bash
+python scripts/run_modeling.py \
+  --data-path data/processed/insurance_data_final_cleaned.parquet \
+  --report-path reports/modeling_report.md
+```
+Outputs include metrics (ROC-AUC/F1 for frequency; RMSE/R² for regressions) and SHAP top features where available.
+
 ## Tests and CI
 ```bash
 pytest -v
